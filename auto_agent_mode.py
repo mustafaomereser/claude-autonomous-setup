@@ -26,7 +26,7 @@ def get_quota_and_reset_time():
         output = stdout + "\n" + stderr
     except Exception as e:
         print(f"❌ [HATA] Kota sorgusu sırasında bir aksaklık oluştu: {e}")
-        pass
+        return None
 
     # Dinamik zaman formatlarını yakalar (Örn: Jun 20, 8:59am veya 9am)
     match = re.search(r'resets\s+([A-Za-z]+)\s+(\d+),\s+(\d+):?(\d*)(am|pm)', output, re.IGNORECASE)
@@ -67,9 +67,8 @@ def calculate_sleep_seconds(month_str, day, hour, minute, ampm):
 def read_agent_prompt_from_file():
     """Belirtilen prompt dosyasını okur ve içeriğini doğrular."""
     if not os.path.exists(PROMPT_FILE_NAME):
-        # Kullanıcıya kolaylık olsun diye dosya yoksa otomatik şablon oluşturuyoruz
         with open(PROMPT_FILE_NAME, "w", encoding="utf-8") as f:
-            f.write("/loop Sen kıdemli bir autonomous software engineer'sin.\n\nKurallarını buraya yaz...")
+            f.write("/loop Sen kıdemli bir autonomous software engineer'sin.\n\nKurallarını buraya yaz...\n\nGörevi tamamen bitirdiğinde terminale KESİNLİKLE '### AGENT_TASK_COMPLETED ###' yaz.")
         print(f"📁 [DOSYA] '{PROMPT_FILE_NAME}' bulunamadı. Boş bir şablon oluşturuldu!")
         print(f"👉 Lütfen '{PROMPT_FILE_NAME}' dosyasının içini doldurup programı tekrar çalıştırın.")
         sys.exit()
@@ -86,11 +85,10 @@ def read_agent_prompt_from_file():
 
 def run_autonomous_agent_loop():
     print("=" * 60)
-    print("🤖 CLAUDE AUTONOMOUS AGENT FILE-BASED ENGINE STARTED")
-    print("🛡️  Tüm süreç imleç konumundan ve pencerelerden bağımsız yürütülür.")
+    print("🤖 CLAUDE AUTONOMOUS AGENT ENGINE STARTED (WITH AUTO-EXIT)")
+    print("🛡️  Tüm süreç canlı çıktı takibiyle yönetiliyor.")
     print("=" * 60)
 
-    # Promptu doğrudan text dosyasından çekiyoruz
     agent_prompt = read_agent_prompt_from_file()
     print(f"✅ [BAŞARILI] '{PROMPT_FILE_NAME}' başarıyla yüklendi. (Karakter Sayısı: {len(agent_prompt)})")
 
@@ -98,16 +96,52 @@ def run_autonomous_agent_loop():
 
     while True:
         if is_first_run:
-            cmd_command = f'start "Claude Ajan Oturumu" cmd /c "claude -p \\"{agent_prompt}\\" --dangerously-skip-permissions"'
+            cmd_command = f'claude -p "{agent_prompt}" --dangerously-skip-permissions'
             is_first_run = False
         else:
-            cmd_command = 'start "Claude Ajan Oturumu" cmd /c "claude -p \\"continue\\" --continue --dangerously-skip-permissions"'
+            cmd_command = 'claude -p "continue" --continue --dangerously-skip-permissions'
 
-        print(f"\n🚀 [AKIŞ] Canlı Ajan ekranı fırlatılıyor...")
-        subprocess.Popen(cmd_command, shell=True)
+        print(f"\n🚀 [AKIŞ] Canlı Ajan oturumu başlatıldı, çıktılar dinleniyor...")
 
-        time.sleep(8)
+        # Süreci arkada başlatıp çıktı kanalını (stdout) ele geçiriyoruz
+        process = subprocess.Popen(
+            cmd_command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='ignore'
+        )
 
+        task_completed = False
+
+        # Canlı terminal çıktılarını satır satır yakalayan döngü
+        while True:
+            stdout_line = process.stdout.readline()
+
+            # Eğer çıktı bittiyse ve süreç sonlandıysa iç döngüden çık
+            if not stdout_line and process.poll() is not None:
+                break
+
+            if stdout_line:
+                # Gelen çıktıyı ekrana anlık olarak basıyoruz
+                print(stdout_line.rstrip())
+
+                # Belirlediğimiz tetikleyici kelime anahtarı kontrol et
+                if "### AGENT_TASK_COMPLETED ###" in stdout_line:
+                    task_completed = True
+                    print("\n🎉 [TEBRİKLER] Ajan görevinin bittiğini bildirdi!")
+                    break
+
+        # Eğer ajan işi bitirdiyse süreci sonlandır ve ana sonsuz döngüyü kır
+        if task_completed:
+            process.terminate()
+            print("👋 [ÇIKIŞ] Otomasyon başarıyla tamamlandı. Kapatılıyor.")
+            break
+
+        # İş bitmediyse ama süreç durduysa kota/limit kontrolüne geç
+        print("\n⚠️  [DURUM] Ajan oturumu kesildi veya limite takıldı. Durum kontrol ediliyor...")
         time_data = get_quota_and_reset_time()
 
         if time_data:
@@ -122,7 +156,7 @@ def run_autonomous_agent_loop():
 
             print("\n⏰ [UYANIŞ] Süre doldu! Sunucu kilitleri açıldı. Ajan canlandırılıyor...")
         else:
-            print("🟢 [DURUM] Şu an limit algılanamadı veya ajan aktif çalışıyor. 10 dakika beklenecek...")
+            print("🟢 [DURUM] Şu an net bir limit algılanamadı. 10 dakika beklenecek...")
             time.sleep(600)
 
 

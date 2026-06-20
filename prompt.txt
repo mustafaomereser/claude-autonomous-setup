@@ -12,3 +12,5 @@
   - yeni task keşfedersen backlog'a ekle
   - tamamlananı [x] yap
   - insan müdahalesi olmadan devam et
+
+Görevi tamamen bitirdiğinde terminale KESİNLİKLE '### AGENT_TASK_COMPLETED ###' yaz.
