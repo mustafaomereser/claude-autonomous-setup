@@ -1,11 +1,3 @@
 # Architecture
 
-## System Overview
-(Burayı Claude dolduracak)
-
-## Modules
-- Auth
-- Users
-- Core
-
-## Notes
+<!-- Agent tarafından doldurulur. Boş bırakın. -->

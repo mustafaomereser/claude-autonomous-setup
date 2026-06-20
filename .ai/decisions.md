@@ -1,8 +1,17 @@
 # Decisions Log
 
-## Format
-YYYY-MM-DD
+> Agent mimari veya kritik bir karar aldığında buraya yazar.
+> Format: tarih → karar → neden → etki
 
-Decision:
-Reason:
-Impact:
+---
+
+## Örnek Format
+
+## YYYY-MM-DD
+Decision: [Ne kararlaştırıldı — tek cümle]
+Reason: [Neden bu karar alındı — somut gerekçe]
+Impact: [Bu kararın etkilediği dosyalar / pattern'ler / kurallar]
+
+---
+
+<!-- Kararlar buradan aşağıya eklenir -->
