@@ -116,9 +116,13 @@ def handle_event(obj):
         info   = obj.get("rate_limit_info", {})
         status = info.get("status")
         ts     = info.get("resetsAt")
-        if status != "allowed":
-            return f"\n[rate_limit: {status}]\n", True, ts
-        return None, False, None
+        if status == "allowed":
+            return None, False, None
+        if status == "allowed_warning":
+            # Yaklaşıyoruz ama henüz bloklanmadık — logla, devam et
+            return f"\n[rate_limit: {status} — devam ediliyor]\n", False, None
+        # blocked veya bilinmeyen engelleyici status
+        return f"\n[rate_limit: {status} — bekleniyor]\n", True, ts
 
     # --- Hata ---
     if t == "error":
