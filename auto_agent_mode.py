@@ -6,6 +6,28 @@ import time
 import subprocess
 from datetime import datetime, timedelta
 
+# Windows'ta ANSI renk desteğini etkinleştir
+if sys.platform == "win32":
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+
+class C:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    CYAN    = "\033[96m"
+    ORANGE  = "\033[38;5;208m"
+    WHITE   = "\033[97m"
+    GRAY    = "\033[90m"
+
+def c(color, text):
+    return f"{color}{text}{C.RESET}"
+
 PROMPT_FILE = "prompt.txt"
 LOG_FILE    = "agent_output.log"
 DONE_MARKER = "### AGENT_TASK_COMPLETED ###"
@@ -35,7 +57,8 @@ def emit(text):
 
 
 def log(msg):
-    emit(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    ts = c(C.GRAY, f"[{datetime.now().strftime('%H:%M:%S')}]")
+    emit(f"{ts} {msg}\n")
 
 
 def read_prompt():
@@ -82,11 +105,12 @@ def handle_event(obj):
             if bt == "text":
                 text = block["text"].strip()
                 if text:
-                    parts.append(text + "\n")
+                    parts.append(c(C.WHITE, text) + "\n")
             elif bt == "tool_use":
                 name   = block.get("name", "?")
                 detail = _tool_detail(block.get("input", {}))
-                parts.append(f"  -> {name}({detail})\n" if detail else f"  -> {name}()\n")
+                call   = f"{c(C.YELLOW, '->')} {c(C.BOLD, name)}{c(C.DIM, f'({detail})')}" if detail else f"{c(C.YELLOW, '->')} {c(C.BOLD, name)}{c(C.DIM, '()')}"
+                parts.append(f"  {call}\n")
             elif bt == "thinking":
                 pass  # iç düşünme, gösterme
         return "".join(parts) or None, False, None
@@ -102,15 +126,15 @@ def handle_event(obj):
             if finfo:
                 path   = finfo.get("filePath", "")
                 nlines = finfo.get("numLines", "?")
-                return f"  <- Read({path}) [{nlines} satır]\n", False, None
+                return f"  {c(C.GREEN, '<-')} {c(C.DIM, f'Read({path}) [{nlines} satır]')}\n", False, None
             content = result.get("content", "")
             snippet = str(content)[:80].replace("\n", " ")
-            return f"  <- {snippet}\n", False, None
+            return f"  {c(C.GREEN, '<-')} {c(C.DIM, snippet)}\n", False, None
         if rtype == "error":
             msg = result.get("message", "")
-            return f"  <- ERROR: {msg}\n", False, None
+            return f"  {c(C.RED+C.BOLD, '<- ERROR:')} {c(C.RED, msg)}\n", False, None
         if rtype == "base64":
-            return f"  <- [binary data]\n", False, None
+            return f"  {c(C.GREEN, '<-')} {c(C.DIM, '[binary data]')}\n", False, None
         return None, False, None
 
     # --- Rate limit ---
@@ -121,25 +145,24 @@ def handle_event(obj):
         if status == "allowed":
             return None, False, None
         if status == "allowed_warning":
-            # Yaklaşıyoruz ama henüz bloklanmadık — logla, devam et
-            return f"\n[rate_limit: {status} — devam ediliyor]\n", False, None
+            return f"\n{c(C.ORANGE, f'[rate_limit: {status} — devam ediliyor]')}\n", False, None
         # blocked veya bilinmeyen engelleyici status
-        return f"\n[rate_limit: {status} — bekleniyor]\n", True, ts
+        return f"\n{c(C.RED+C.BOLD, f'[rate_limit: {status} — bekleniyor]')}\n", True, ts
 
     # --- Hata ---
     if t == "error":
         err = obj.get("error", {})
         msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-        return f"\n[error: {msg}]\n", False, None
+        return f"\n{c(C.RED+C.BOLD, f'[error: {msg}]')}\n", False, None
 
     # --- Oturum sonu ---
     if t == "result":
         cost = obj.get("total_cost_usd")
         if sub == "error_max_turns":
-            return "\n[max turns]\n", False, None
+            return f"\n{c(C.YELLOW, '[max turns]')}\n", False, None
         if cost is not None:
             turns = obj.get("num_turns", "?")
-            return f"\n[tur:{turns} maliyet:${cost:.4f}]\n", False, None
+            return f"\n{c(C.CYAN, f'[tur:{turns} maliyet:${cost:.4f}]')}\n", False, None
 
     # --- system/thinking gibi meta eventler: yoksay ---
     return None, False, None
@@ -199,7 +222,7 @@ def stream_process(cmd, stdin_data=None):
 
     stderr_out = proc.stderr.read().decode("utf-8", errors="ignore").strip()
     if stderr_out:
-        emit(f"\n[stderr] {stderr_out}\n")
+        emit(f"\n{c(C.RED, '[stderr]')} {c(C.DIM, stderr_out)}\n")
         collected.append(stderr_out)
 
     proc.wait()
@@ -274,9 +297,9 @@ def get_reset_datetime(resets_ts=None):
 
 def main():
     open(LOG_FILE, "w", encoding="utf-8").close()  # sıfırla
-    log("Agent basliyor...")
+    log(c(C.CYAN + C.BOLD, "Agent başlıyor..."))
     prompt = read_prompt()
-    log(f"Prompt yuklendi ({len(prompt)} karakter)")
+    log(c(C.CYAN, f"Prompt yüklendi ({len(prompt)} karakter)"))
 
     first_run = True
     BASE = "-p - --output-format stream-json --verbose --dangerously-skip-permissions"
@@ -290,28 +313,28 @@ def main():
             cmd = f'claude {BASE} --continue'
             stdin_data = b"continue"
 
-        log(f"Oturum baslatiliyor...")
+        log(c(C.BLUE, "Oturum başlatılıyor..."))
         output, limit_hit, resets_ts = stream_process(cmd, stdin_data=stdin_data)
 
         if DONE_MARKER in output:
-            log("Gorev tamamlandi.")
+            log(c(C.GREEN + C.BOLD, "✓ Görev tamamlandı."))
             break
 
         if limit_hit:
-            log("Limit vurdu.")
+            log(c(C.ORANGE, "Limit vurdu."))
         else:
-            log("Oturum bitti, gorev tamamlanmadi.")
+            log(c(C.YELLOW, "Oturum bitti, görev tamamlanmadı."))
 
         target = get_reset_datetime(resets_ts)
 
         if target:
             wait = max(0, int((target - datetime.now()).total_seconds()))
-            log(f"Reset: {target.strftime('%d %b %H:%M:%S')} — {wait}s bekleniyor.")
+            log(c(C.ORANGE, f"Reset: {target.strftime('%d %b %H:%M:%S')} — {wait}s bekleniyor."))
             if wait > 0:
                 time.sleep(wait)
-            log("Uyandi, devam ediliyor...")
+            log(c(C.GREEN, "Uyandı, devam ediliyor..."))
         else:
-            log("Reset zamani bulunamadi, 10dk bekleniyor.")
+            log(c(C.YELLOW, "Reset zamanı bulunamadı, 10dk bekleniyor."))
             time.sleep(600)
 
 
