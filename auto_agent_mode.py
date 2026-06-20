@@ -94,6 +94,8 @@ def handle_event(obj):
     # --- Tool sonucu (user mesajı olarak gelir) ---
     if t == "user":
         result = obj.get("tool_use_result", {})
+        if not isinstance(result, dict):
+            return None, False, None
         rtype  = result.get("type", "")
         if rtype == "text":
             finfo = result.get("file")
