@@ -326,7 +326,7 @@ def main():
 
     use_continue = False
     wake_msg     = b"."
-    BASE         = "-p - --output-format stream-json --dangerously-skip-permissions"
+    BASE         = "-p - --output-format stream-json --verbose --dangerously-skip-permissions"
 
     while True:
         if use_continue:
