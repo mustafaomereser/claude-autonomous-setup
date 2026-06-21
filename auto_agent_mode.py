@@ -4,7 +4,7 @@ import re
 import sys
 import time
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Windows'ta ANSI renk desteğini etkinleştir
 if sys.platform == "win32":
@@ -28,16 +28,12 @@ class C:
 def c(color, text):
     return f"{color}{text}{C.RESET}"
 
-PROMPT_FILE = "prompt.txt"
-LOG_FILE    = "agent_output.log"
-DONE_MARKER = "### AGENT_TASK_COMPLETED ###"
+PROMPT_FILE    = "prompt.txt"
+LOG_FILE       = "agent_output.log"
+DONE_MARKER    = "### AGENT_TASK_COMPLETED ###"
+AI_DIR         = ".ai"
+CONTEXT_FILES  = ["rules.md", "backlog.md", "progress.md", "decisions.md"]
 
-MONTHS = {
-    "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-    "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12,
-}
-RE_RESET_DATED = re.compile(r'Resets\s+([A-Za-z]+)\s+(\d+),\s+(\d+):(\d+)(am|pm)', re.I)
-RE_RESET_TIME  = re.compile(r'Resets\s+(\d+):(\d+)(am|pm)', re.I)
 
 
 _log_file = None
@@ -59,6 +55,51 @@ def emit(text):
 def log(msg):
     ts = c(C.GRAY, f"[{datetime.now().strftime('%H:%M:%S')}]")
     emit(f"{ts} {msg}\n")
+
+
+def _compress(fname, content):
+    lines = content.splitlines()
+    if fname == "backlog.md":
+        filtered = []
+        skip = False
+        for l in lines:
+            if re.match(r'\s*-\s*\[x\]', l, re.I):
+                skip = True
+                continue
+            if skip:
+                # Boş satır veya girintili satır → hâlâ devam içeriği, atla
+                if l == "" or re.match(r'\s+\S', l):
+                    continue
+                # Girintisiz yeni içerik → bu [x] bloğu bitti
+                skip = False
+            filtered.append(l)
+        lines = filtered
+    lines = [l.rstrip() for l in lines]
+    lines = [l for l in lines if not re.fullmatch(r'[-=]{3,}', l)]
+    result, prev_blank = [], False
+    for l in lines:
+        blank = l == ""
+        if blank and prev_blank:
+            continue
+        result.append(l)
+        prev_blank = blank
+    return "\n".join(result).strip()
+
+
+def build_context():
+    parts = []
+    for fname in CONTEXT_FILES:
+        path = os.path.join(AI_DIR, fname)
+        if not os.path.exists(path):
+            continue
+        content = open(path, encoding="utf-8").read().strip()
+        if content:
+            compressed = _compress(fname, content)
+            if compressed:
+                parts.append(f"### {fname}\n{compressed}")
+    if not parts:
+        return ""
+    return "\n\n---\n# MEVCUT BAĞLAM (.ai/ dosyaları)\n\n" + "\n\n".join(parts)
 
 
 def read_prompt():
@@ -98,8 +139,10 @@ def handle_event(obj):
 
     # --- Asistan yanıtı ---
     if t == "assistant":
-        content = obj.get("message", {}).get("content", [])
-        parts = []
+        msg     = obj.get("message", {})
+        content = msg.get("content", [])
+        usage   = msg.get("usage", {})
+        parts   = []
         for block in content:
             bt = block.get("type")
             if bt == "text":
@@ -112,7 +155,12 @@ def handle_event(obj):
                 call   = f"{c(C.YELLOW, '->')} {c(C.BOLD, name)}{c(C.DIM, f'({detail})')}" if detail else f"{c(C.YELLOW, '->')} {c(C.BOLD, name)}{c(C.DIM, '()')}"
                 parts.append(f"  {call}\n")
             elif bt == "thinking":
-                pass  # iç düşünme, gösterme
+                pass
+        if usage:
+            inp = usage.get("input_tokens", 0)
+            out = usage.get("output_tokens", 0)
+            if inp or out:
+                parts.append(f"  {c(C.GRAY, f'[in:{inp:,} out:{out:,}]')}\n")
         return "".join(parts) or None, False, None
 
     # --- Tool sonucu (user mesajı olarak gelir) ---
@@ -142,12 +190,26 @@ def handle_event(obj):
         info   = obj.get("rate_limit_info", {})
         status = info.get("status")
         ts     = info.get("resetsAt")
+
+        # Yüzde hesapla — hangi alan gelirse
+        pct = None
+        for used_key, limit_key in [
+            ("tokensUsed",    "tokensLimit"),
+            ("requestsUsed",  "requestsLimit"),
+            ("messagesUsed",  "messagesLimit"),
+        ]:
+            used  = info.get(used_key)
+            limit = info.get(limit_key)
+            if used is not None and limit:
+                pct = int(used / limit * 100)
+                break
+        pct_str = f" {pct}% kullanıldı" if pct is not None else ""
+
         if status == "allowed":
             return None, False, None
         if status == "allowed_warning":
-            return f"\n{c(C.ORANGE, f'[rate_limit: {status} — devam ediliyor]')}\n", False, None
-        # blocked veya bilinmeyen engelleyici status
-        return f"\n{c(C.RED+C.BOLD, f'[rate_limit: {status} — bekleniyor]')}\n", True, ts
+            return f"\n{c(C.ORANGE, f'[rate_limit: uyarı{pct_str} — devam ediliyor]')}\n", False, None
+        return f"\n{c(C.RED+C.BOLD, f'[rate_limit: bloke{pct_str} — bekleniyor]')}\n", True, ts
 
     # --- Hata ---
     if t == "error":
@@ -162,10 +224,22 @@ def handle_event(obj):
             return f"\n{c(C.YELLOW, '[max turns]')}\n", False, None
         if cost is not None:
             turns = obj.get("num_turns", "?")
-            return f"\n{c(C.CYAN, f'[tur:{turns} maliyet:${cost:.4f}]')}\n", False, None
+            usage = obj.get("usage", {})
+            inp   = usage.get("input_tokens", 0)
+            out   = usage.get("output_tokens", 0)
+            total = inp + out
+            tok_str = f" | {total:,} token (in:{inp:,} out:{out:,})" if total else ""
+            return f"\n{c(C.CYAN, f'[tur:{turns} | maliyet:${cost:.2f}{tok_str}]')}\n", False, None
 
     # --- system/thinking gibi meta eventler: yoksay ---
     return None, False, None
+
+
+def _get_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
 
 
 def stream_process(cmd, stdin_data=None):
@@ -230,69 +304,11 @@ def stream_process(cmd, stdin_data=None):
     return "".join(collected), limit_hit, resets_ts
 
 
-def parse_reset_target(m_dated=None, m_time=None):
-    now = datetime.now()
-    if m_dated:
-        month_num = MONTHS.get(m_dated.group(1).lower()[:3], now.month)
-        day, hour, minute, ampm = int(m_dated.group(2)), int(m_dated.group(3)), int(m_dated.group(4)), m_dated.group(5).lower()
-    else:
-        month_num = now.month
-        day = now.day
-        hour, minute, ampm = int(m_time.group(1)), int(m_time.group(2)), m_time.group(3).lower()
-
-    if ampm == "pm" and hour < 12:
-        hour += 12
-    if ampm == "am" and hour == 12:
-        hour = 0
-
-    target = now.replace(month=month_num, day=day, hour=hour, minute=minute, second=30, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-    return target
-
 
 def get_reset_datetime(resets_ts=None):
-    """
-    Önce stream'den gelen Unix timestamp'i dener.
-    Yoksa /usage çıktısını parse eder.
-    """
     if resets_ts:
         return datetime.fromtimestamp(resets_ts)
-
-    log("Reset zamani alinamadi, /usage sorgulanıyor...")
-    try:
-        result = subprocess.run(
-            'claude -p "/usage" --output-format stream-json --verbose',
-            shell=True, capture_output=True, text=True, timeout=20,
-            encoding="utf-8", errors="ignore",
-        )
-        output = result.stdout + result.stderr
-    except Exception as e:
-        log(f"/usage hatasi: {e}")
-        return None
-
-    # rate_limit_event içindeki resetsAt
-    earliest_ts = None
-    for line in output.splitlines():
-        try:
-            obj = json.loads(line)
-            if obj.get("type") == "rate_limit_event":
-                ts = obj.get("rate_limit_info", {}).get("resetsAt")
-                if ts and (earliest_ts is None or ts < earliest_ts):
-                    earliest_ts = ts
-        except Exception:
-            pass
-
-    if earliest_ts:
-        return datetime.fromtimestamp(earliest_ts)
-
-    # Son çare: metin regex
-    candidates = []
-    for m in RE_RESET_DATED.finditer(output):
-        candidates.append(parse_reset_target(m_dated=m))
-    for m in RE_RESET_TIME.finditer(output):
-        candidates.append(parse_reset_target(m_time=m))
-    return min(candidates) if candidates else None
+    return None
 
 
 def main():
@@ -301,41 +317,58 @@ def main():
     prompt = read_prompt()
     log(c(C.CYAN, f"Prompt yüklendi ({len(prompt)} karakter)"))
 
-    first_run = True
-    BASE = "-p - --output-format stream-json --verbose --dangerously-skip-permissions"
+    context = build_context()
+    full_prompt = prompt + context if context else prompt
+    log(c(C.CYAN, f"Bağlam enjekte edildi ({len(full_prompt)} karakter)"))
+
+    BACKLOG_PATH = os.path.join(AI_DIR, "backlog.md")
+    WAKE_MSG     = "Yeni görevler backlog.md'ye eklendi. Dosyayı oku ve kaldığın yerden devam et.".encode("utf-8")
+
+    use_continue = False
+    wake_msg     = b"."
+    BASE         = "-p - --output-format stream-json --dangerously-skip-permissions"
 
     while True:
-        if first_run:
-            cmd = f'claude {BASE}'
-            stdin_data = prompt.encode("utf-8")
-            first_run = False
+        if use_continue:
+            cmd        = f'claude {BASE} --continue'
+            stdin_data = wake_msg
         else:
-            cmd = f'claude {BASE} --continue'
-            stdin_data = b"continue"
+            cmd        = f'claude {BASE}'
+            stdin_data = full_prompt.encode("utf-8")
+
+        use_continue = False
+        wake_msg     = b"."
 
         log(c(C.BLUE, "Oturum başlatılıyor..."))
         output, limit_hit, resets_ts = stream_process(cmd, stdin_data=stdin_data)
 
         if DONE_MARKER in output:
-            log(c(C.GREEN + C.BOLD, "✓ Görev tamamlandı."))
-            break
+            log(c(C.GREEN + C.BOLD, "✓ Görev tamamlandı. Backlog izleniyor..."))
+            last_mtime = _get_mtime(BACKLOG_PATH)
+            while True:
+                time.sleep(30)
+                if _get_mtime(BACKLOG_PATH) > last_mtime:
+                    log(c(C.CYAN, "Backlog güncellendi, devam ediliyor..."))
+                    use_continue = True
+                    wake_msg     = WAKE_MSG
+                    break
+            continue
 
         if limit_hit:
             log(c(C.ORANGE, "Limit vurdu."))
+            use_continue = True
+            target = get_reset_datetime(resets_ts)
+            if target:
+                wait = max(0, int((target - datetime.now()).total_seconds()))
+                log(c(C.ORANGE, f"Reset: {target.strftime('%d %b %H:%M:%S')} — {wait}s bekleniyor."))
+                if wait > 0:
+                    time.sleep(wait)
+                log(c(C.GREEN, "Uyandı, devam ediliyor..."))
+            else:
+                log(c(C.YELLOW, "Reset zamanı bulunamadı, 10dk bekleniyor."))
+                time.sleep(600)
         else:
-            log(c(C.YELLOW, "Oturum bitti, görev tamamlanmadı."))
-
-        target = get_reset_datetime(resets_ts)
-
-        if target:
-            wait = max(0, int((target - datetime.now()).total_seconds()))
-            log(c(C.ORANGE, f"Reset: {target.strftime('%d %b %H:%M:%S')} — {wait}s bekleniyor."))
-            if wait > 0:
-                time.sleep(wait)
-            log(c(C.GREEN, "Uyandı, devam ediliyor..."))
-        else:
-            log(c(C.YELLOW, "Reset zamanı bulunamadı, 10dk bekleniyor."))
-            time.sleep(600)
+            log(c(C.YELLOW, "Oturum bitti, yeniden başlatılıyor..."))
 
 
 if __name__ == "__main__":
