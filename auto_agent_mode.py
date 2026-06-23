@@ -289,7 +289,7 @@ def start_log_watcher(stop_event, done_event):
 
 POLL_INTERVAL = 60    # limit yokken kaç saniyede bir sorgulansın
 RECHECK_AFTER = 15    # continue sonrası kaç saniye beklensin
-IDLE_THRESHOLD = 30    # pct kaç tur üst üste aynı kalırsa görev bitti sayılır
+IDLE_THRESHOLD = 45    # pct kaç tur üst üste aynı kalırsa görev bitti sayılır
 
 
 def main():
