@@ -2,7 +2,7 @@
 
 Sana aşağıda mevcut bağlam hazır olarak verilmiştir (.ai/):
 - rules.md: Tüm çalışma kuralların — mutlaka uygula
-- backlog.md: Görev listen — sırayla işle
+- backlog.md: Görev listen — sırayla işle, bitirdiğin görevin yanındaki kutucuğa [x] yap ve completed.md ye taşı.
 - progress.md: Mevcut durum
 - decisions.md: Daha önce alınan mimari kararlar
 

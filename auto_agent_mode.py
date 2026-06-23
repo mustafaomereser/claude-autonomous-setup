@@ -4,6 +4,7 @@ import base64
 import time
 import subprocess
 import re
+import json
 import ctypes
 import ctypes.wintypes as wt
 from datetime import datetime
@@ -87,10 +88,16 @@ def focus_window(hwnd):
 
 # ── Claude başlatma ───────────────────────────────────────────────────────────
 
-PROMPT_FILE = "prompt.txt"
+PROMPT_FILE = "prompt.md"
 LOG_FILE = "agent.log"
 DONE_MARKER = "### AGENT_TASK_COMPLETED ###"
 CLAUDE_START_WAIT = 6   # saniye — claude UI'sinin yüklenmesini bekle
+
+
+def _claude_projects_dir(cwd):
+    """cwd → ~/.claude/projects/<slug> yolunu döndürür."""
+    slug = cwd.replace(":", "-").replace("\\", "-").replace("/", "-").replace(".", "-")
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects", slug)
 
 
 def read_prompt():
@@ -118,23 +125,18 @@ def _all_claude_pids():
 
 
 def launch_claude():
-    """Yeni bir terminalde claude açar (Start-Transcript ile log'a yazar), yeni PID'i döndürür."""
+    """Yeni bir terminalde claude açar; (pid, projects_dir, existing_jsonls) döndürür."""
     before = _all_claude_pids()
-
-    # Log dosyasını sıfırla
-    open(LOG_FILE, "w", encoding="utf-8").close()
-
     cwd = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
-    log_abs = os.path.join(cwd, LOG_FILE)
 
-    # Start-Transcript: piping yok → claude TTY modunda kalır
-    ps_cmd = (
-        f'Set-Location \'{cwd}\'; '
-        f'Start-Transcript -Path \'{log_abs}\'; '
-        f'claude; '
-        f'Stop-Transcript'
-    )
-    # -EncodedCommand ile tırnak/semicolon sorununu tamamen ortadan kaldır
+    # Mevcut JSONL dosyalarını başlatmadan önce kaydet
+    projects_dir = _claude_projects_dir(cwd)
+    try:
+        existing_jsonls = set(os.listdir(projects_dir))
+    except FileNotFoundError:
+        existing_jsonls = set()
+
+    ps_cmd = f'Set-Location \'{cwd}\'; claude'
     enc = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
 
     starters = [
@@ -154,7 +156,7 @@ def launch_claude():
 
     if not started:
         log(c(C.RED, "claude başlatılamadı."))
-        return None
+        return None, None, None
 
     log(c(C.CYAN, "claude başlatıldı, PID bekleniyor..."))
     for _ in range(20):
@@ -163,10 +165,10 @@ def launch_claude():
         if new_pids:
             pid = list(new_pids)[0]
             log(c(C.GREEN, f"claude PID: {pid}"))
-            return pid
+            return pid, projects_dir, existing_jsonls
 
     log(c(C.RED, "Yeni claude PID'i bulunamadı."))
-    return None
+    return None, None, None
 
 
 def send_prompt(hwnd, text, pyautogui):
@@ -240,45 +242,111 @@ def usage_sorgu():
 
 # ── Log izleyici ─────────────────────────────────────────────────────────────
 
-def start_log_watcher(stop_event, done_event):
-    """agent.log'u tail eder, DONE_MARKER görününce done_event'i set eder."""
+def _agent_log(msg):
+    """agent.log'a timestamp ile satır yaz."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {msg}\n")
+
+
+def _fmt_tokens(usage):
+    """usage dict'inden okunabilir token özeti üret."""
+    inp = usage.get("input_tokens", 0)
+    out = usage.get("output_tokens", 0)
+    cache_r = usage.get("cache_read_input_tokens", 0)
+    cache_w = usage.get("cache_creation_input_tokens", 0)
+    total = inp + out + cache_r + cache_w
+    parts = [f"in={inp}", f"out={out}"]
+    if cache_r:
+        parts.append(f"cache_read={cache_r}")
+    if cache_w:
+        parts.append(f"cache_write={cache_w}")
+    parts.append(f"total={total}")
+    return "  ".join(parts)
+
+
+def start_log_watcher(stop_event, done_event, projects_dir, existing_jsonls):
+    """
+    Yeni JSONL oturum dosyasını tail eder; her assistant mesajını agent.log'a yazar.
+    DONE_MARKER görününce done_event'i set eder.
+    """
     def _watch():
-        # Dosya oluşana kadar bekle
-        log(c(C.GRAY, f"Log watcher başladı — '{LOG_FILE}' bekleniyor..."))
+        open(LOG_FILE, "w", encoding="utf-8").close()
+        _agent_log("=== OTURUM BAŞLADI ===")
+        log(c(C.GRAY, "JSONL watcher başladı — yeni oturum dosyası bekleniyor..."))
+
+        session_file = None
         while not stop_event.is_set():
-            if os.path.exists(LOG_FILE):
-                break
-            time.sleep(0.5)
-
-        # PowerShell 5.1 Start-Transcript UTF-16 LE yazar; utf-16 BOM'u otomatik çözer
-        encodings = ["utf-16", "utf-8-sig", "utf-8"]
-        f = None
-        for enc in encodings:
             try:
-                f = open(LOG_FILE, "r", encoding=enc, errors="ignore")
-                log(c(C.GRAY, f"Log watcher açıldı (encoding: {enc})."))
-                break
+                current = set(os.listdir(projects_dir))
             except Exception:
-                pass
+                time.sleep(1)
+                continue
+            new_files = [f for f in (current - existing_jsonls) if f.endswith(".jsonl")]
+            if new_files:
+                session_file = os.path.join(
+                    projects_dir,
+                    max(new_files, key=lambda f: os.path.getmtime(os.path.join(projects_dir, f)))
+                )
+                _agent_log(f"Oturum: {os.path.basename(session_file)}")
+                log(c(C.GRAY, f"Oturum dosyası: {os.path.basename(session_file)}"))
+                break
+            time.sleep(1)
 
-        if f is None:
-            log(c(C.RED, "Log dosyası açılamadı."))
+        if not session_file:
             return
 
-        lines_read = 0
-        with f:
+        msg_count = 0
+        with open(session_file, "r", encoding="utf-8", errors="ignore") as f:
             while not stop_event.is_set():
                 line = f.readline()
                 if not line:
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                     continue
-                lines_read += 1
-                if lines_read % 20 == 0:
-                    log(c(C.GRAY, f"[log] {lines_read} satır okundu..."))
-                if DONE_MARKER in line:
-                    log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_COMPLETED algılandı — izleme durduruluyor."))
-                    done_event.set()
-                    return
+
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                obj_type = obj.get("type")
+
+                if obj_type == "assistant":
+                    msg_count += 1
+                    msg = obj.get("message", {})
+                    model = msg.get("model", "?")
+                    usage = msg.get("usage", {})
+                    stop_reason = msg.get("stop_reason", "?")
+
+                    texts = []
+                    tool_calls = []
+                    for block in msg.get("content", []):
+                        btype = block.get("type")
+                        if btype == "text":
+                            t = block.get("text", "").strip()
+                            if t:
+                                texts.append(t)
+                        elif btype == "tool_use":
+                            tool_calls.append(block.get("name", "?"))
+
+                    _agent_log(f"── MESAJ #{msg_count} [{model}] stop={stop_reason} ──")
+                    _agent_log(f"   Tokenlar: {_fmt_tokens(usage)}")
+                    if texts:
+                        for t in texts:
+                            preview = t[:300].replace("\n", " ")
+                            _agent_log(f"   Yanıt: {preview}")
+                    if tool_calls:
+                        _agent_log(f"   Araçlar: {', '.join(tool_calls)}")
+
+                    tok_str = f"in={usage.get('input_tokens',0)} out={usage.get('output_tokens',0)}"
+                    log(c(C.GRAY, f"[{model}] #{msg_count} {tok_str}  stop={stop_reason}"))
+
+                    # Sadece asistan yanıtlarında DONE_MARKER ara (kullanıcı prompt'unu atla)
+                    if any(DONE_MARKER in t for t in texts):
+                        _agent_log(f"=== {DONE_MARKER} ===")
+                        log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_COMPLETED algılandı — izleme durduruluyor."))
+                        done_event.set()
+                        return
 
     t = threading.Thread(target=_watch, daemon=True)
     t.start()
@@ -287,12 +355,12 @@ def start_log_watcher(stop_event, done_event):
 
 # ── Ana döngü ─────────────────────────────────────────────────────────────────
 
-POLL_INTERVAL  = 60    # limit yokken kaç saniyede bir sorgulansın
-RECHECK_AFTER  = 15    # continue sonrası kaç saniye beklensin
+POLL_INTERVAL = 60    # limit yokken kaç saniyede bir sorgulansın
+RECHECK_AFTER = 15    # continue sonrası kaç saniye beklensin
 IDLE_THRESHOLD = 30    # pct kaç tur üst üste aynı kalırsa görev bitti sayılır
-BACKLOG_FILE   = os.path.join(".ai", "backlog.md")
-BACKLOG_MSG    = "Backlog güncellendi. Dosyayı oku ve kaldığın yerden devam et."
-BACKLOG_POLL   = 30    # backlog izleme aralığı (saniye)
+BACKLOG_FILE = os.path.join(".ai", "backlog.md")
+BACKLOG_MSG = "Backlog güncellendi. Dosyayı oku ve kaldığın yerden devam et."
+BACKLOG_POLL = 30    # backlog izleme aralığı (saniye)
 
 
 def main():
@@ -310,7 +378,7 @@ def main():
     print(c(C.GRAY, f"Prompt: {PROMPT_FILE} ({len(prompt)} karakter) — Ctrl+C ile durdur\n"))
 
     # Claude'u aç
-    pid = launch_claude()
+    pid, projects_dir, existing_jsonls = launch_claude()
     if not pid:
         sys.exit(1)
 
@@ -329,10 +397,10 @@ def main():
     send_prompt(hwnd, prompt, pyautogui)
     log(c(C.GREEN, "Prompt gönderildi. İzleme başlıyor...\n"))
 
-    # Log watcher başlat
+    # JSONL watcher başlat
     stop_event = threading.Event()
     done_event = threading.Event()
-    start_log_watcher(stop_event, done_event)
+    start_log_watcher(stop_event, done_event, projects_dir, existing_jsonls)
 
     # İzleme döngüsü
     last_pct = None
@@ -449,7 +517,11 @@ def main():
             same_pct_count = 0
             stop_event.clear()
             done_event.clear()
-            start_log_watcher(stop_event, done_event)
+            try:
+                existing_jsonls = set(os.listdir(projects_dir))
+            except Exception:
+                existing_jsonls = set()
+            start_log_watcher(stop_event, done_event, projects_dir, existing_jsonls)
 
             # Ana izleme döngüsünü yeniden çalıştır
             while True:
