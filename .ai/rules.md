@@ -1,6 +1,7 @@
 # Agent Rules
 
 - backlog.md sırayla işlenir, üstten alta
+- tek seferde sadece bir görev yap o görev tamamlanmadan diğerine asla ama sakın ama katiyen geçme!
 - Her task sonunda progress.md güncellenir (completed'a ekle, current task güncelle)
 - Mimari/kritik karar alınınca decisions.md'ye yaz
 - Görev belirsizse architecture.md'yi referans al, sormadan en mantıklı kararı ver
