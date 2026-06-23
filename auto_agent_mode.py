@@ -407,6 +407,103 @@ def main():
 
         time.sleep(RECHECK_AFTER)
 
+    # ── Görev bitti — backlog izlemeye geç ───────────────────────────────────
+    log(c(C.CYAN + C.BOLD, "Backlog izleniyor... (.ai/backlog.md)"))
+
+    def _backlog_mtime():
+        try:
+            return os.path.getmtime(BACKLOG_FILE)
+        except OSError:
+            return 0
+
+    last_mtime = _backlog_mtime()
+
+    while True:
+        time.sleep(BACKLOG_POLL)
+
+        # claude kapandıysa çık
+        if pid not in _all_claude_pids():
+            log(c(C.YELLOW, "claude.exe kapandı, backlog izleme durdu."))
+            break
+
+        mtime = _backlog_mtime()
+        if mtime > last_mtime:
+            last_mtime = mtime
+            log(c(C.CYAN, "Backlog değişti, claude'a bildiriliyor..."))
+
+            hwnd = _terminal_hwnd(pid)
+            if not hwnd:
+                log(c(C.RED, "Terminal penceresi bulunamadı."))
+                continue
+
+            focus_window(hwnd)
+            clipboard_set(BACKLOG_MSG)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(0.2)
+            pyautogui.press("enter")
+            log(c(C.GREEN, "Backlog mesajı gönderildi."))
+
+            # Yeni görev başladı — izleme döngüsüne geri dön
+            log(c(C.CYAN, "Yeni görev izleniyor..."))
+            last_pct = None
+            same_pct_count = 0
+            stop_event.clear()
+            done_event.clear()
+            start_log_watcher(stop_event, done_event)
+
+            # Ana izleme döngüsünü yeniden çalıştır
+            while True:
+                if done_event.is_set():
+                    stop_event.set()
+                    break
+                time.sleep(POLL_INTERVAL)
+                if done_event.is_set():
+                    stop_event.set()
+                    break
+                if pid not in _all_claude_pids():
+                    log(c(C.YELLOW, "claude.exe kapandı."))
+                    stop_event.set()
+                    break
+                reset_at, pct = usage_sorgu()
+                if reset_at is None:
+                    if pct == last_pct:
+                        same_pct_count += 1
+                        log(c(C.GRAY, f"Limit yok (%{pct}, {same_pct_count}/{IDLE_THRESHOLD} tur sabit)."))
+                        if same_pct_count >= IDLE_THRESHOLD:
+                            log(c(C.GREEN + C.BOLD, "✓ Görev tamamlandı — backlog bekleniyor."))
+                            stop_event.set()
+                            break
+                    else:
+                        same_pct_count = 0
+                        log(c(C.GRAY, f"Limit yok (%{pct})."))
+                    last_pct = pct
+                    continue
+                bekle = max(0, int((reset_at - datetime.now()).total_seconds()))
+                log(c(C.ORANGE, f"Limit dolu (%{pct}). {bekle}s bekleniyor."))
+                while True:
+                    if done_event.is_set():
+                        break
+                    kalan = int((reset_at - datetime.now()).total_seconds())
+                    if kalan <= 0:
+                        break
+                    time.sleep(min(60, kalan))
+                if done_event.is_set():
+                    stop_event.set()
+                    break
+                hwnd = _terminal_hwnd(pid)
+                if not hwnd:
+                    break
+                focus_window(hwnd)
+                pyautogui.typewrite("continue", interval=0.05)
+                pyautogui.press("enter")
+                log(c(C.GREEN, "continue gönderildi."))
+                same_pct_count = 0
+                last_pct = None
+                time.sleep(RECHECK_AFTER)
+
+            log(c(C.CYAN + C.BOLD, "Backlog izleniyor..."))
+            last_mtime = _backlog_mtime()
+
 
 if __name__ == "__main__":
     try:
