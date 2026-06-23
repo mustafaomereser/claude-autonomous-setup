@@ -287,9 +287,12 @@ def start_log_watcher(stop_event, done_event):
 
 # ── Ana döngü ─────────────────────────────────────────────────────────────────
 
-POLL_INTERVAL = 60    # limit yokken kaç saniyede bir sorgulansın
-RECHECK_AFTER = 15    # continue sonrası kaç saniye beklensin
-IDLE_THRESHOLD = 45    # pct kaç tur üst üste aynı kalırsa görev bitti sayılır
+POLL_INTERVAL  = 60    # limit yokken kaç saniyede bir sorgulansın
+RECHECK_AFTER  = 15    # continue sonrası kaç saniye beklensin
+IDLE_THRESHOLD = 30    # pct kaç tur üst üste aynı kalırsa görev bitti sayılır
+BACKLOG_FILE   = os.path.join(".ai", "backlog.md")
+BACKLOG_MSG    = "Backlog güncellendi. Dosyayı oku ve kaldığın yerden devam et."
+BACKLOG_POLL   = 30    # backlog izleme aralığı (saniye)
 
 
 def main():
