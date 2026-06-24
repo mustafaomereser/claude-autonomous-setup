@@ -16,4 +16,7 @@ Dolu ise → yeni özellik/sayfa üretmeden önce veya proje yapısına ihtiyaç
 
 Bunun dışında her şey rules.md'deki kurallara göre yürür.
 
+Her yeni bir göreve başladığında ### AGENT_TASK_STARTED ### yaz,
 Tüm backlog bittiğinde ya da bloke olunduğunda terminale '### AGENT_TASK_COMPLETED ###' yaz.
+
+Başlangıçta kural listesinde anladıklarını ve anlamadıklarını bana kesin cevap olarak yaz.

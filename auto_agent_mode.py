@@ -360,41 +360,73 @@ def start_log_watcher(stop_event, done_event, resume_event, projects_dir, existi
 
 def start_resume_watcher(resume_event, projects_dir):
     """
-    Backlog modunda çalışır: mevcut en güncel JSONL dosyasının SONUNDAN izlemeye başlar,
+    Backlog modunda çalışır: mevcut JSONL'ın sonunu VE yeni oluşan JSONL dosyalarını izler.
     RESUME_MARKER görününce resume_event set eder.
     """
     def _watch():
+        # Başlangıçtaki dosya listesini kaydet (yeni dosyaları tespit için)
         try:
-            files = [f for f in os.listdir(projects_dir) if f.endswith(".jsonl")]
-            if not files:
-                return
-            session_file = os.path.join(
-                projects_dir,
-                max(files, key=lambda f: os.path.getmtime(os.path.join(projects_dir, f)))
-            )
+            known_files = set(os.listdir(projects_dir))
         except Exception:
-            return
+            known_files = set()
 
-        log(c(C.GRAY, f"Resume watcher: {os.path.basename(session_file)}"))
+        # Mevcut en güncel JSONL'ın sonuna konumlan
+        current_fh = None
+        try:
+            jsonls = [f for f in known_files if f.endswith(".jsonl")]
+            if jsonls:
+                fname = max(jsonls, key=lambda f: os.path.getmtime(os.path.join(projects_dir, f)))
+                current_fh = open(os.path.join(projects_dir, fname), "r", encoding="utf-8", errors="ignore")
+                current_fh.seek(0, 2)
+                log(c(C.GRAY, f"Resume watcher: {fname}"))
+        except Exception:
+            pass
 
-        with open(session_file, "r", encoding="utf-8", errors="ignore") as f:
-            f.seek(0, 2)  # dosyanın sonuna konumlan — sadece yeni satırları izle
-            while not resume_event.is_set():
-                line = f.readline()
-                if not line:
-                    time.sleep(0.5)
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if obj.get("type") == "assistant":
-                    for block in obj.get("message", {}).get("content", []):
-                        if block.get("type") == "text" and RESUME_MARKER in block.get("text", ""):
-                            _agent_log(f"=== {RESUME_MARKER} (resume watcher) ===")
-                            log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_STARTED algılandı (resume watcher)."))
-                            resume_event.set()
-                            return
+        def _check_line(line):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                return False
+            if obj.get("type") == "assistant":
+                for block in obj.get("message", {}).get("content", []):
+                    if block.get("type") == "text" and RESUME_MARKER in block.get("text", ""):
+                        _agent_log(f"=== {RESUME_MARKER} (resume watcher) ===")
+                        log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_STARTED algılandı (resume watcher)."))
+                        resume_event.set()
+                        return True
+            return False
+
+        while not resume_event.is_set():
+            # Mevcut dosyada yeni satır var mı?
+            if current_fh:
+                line = current_fh.readline()
+                if line:
+                    if _check_line(line):
+                        current_fh.close()
+                        return
+                    continue  # daha fazla satır olabilir, sleep'e geçme
+
+            # Yeni JSONL dosyası oluştu mu?
+            try:
+                all_files = set(os.listdir(projects_dir))
+            except Exception:
+                time.sleep(0.5)
+                continue
+
+            new_jsonls = [f for f in (all_files - known_files) if f.endswith(".jsonl")]
+            if new_jsonls:
+                fname = max(new_jsonls, key=lambda f: os.path.getmtime(os.path.join(projects_dir, f)))
+                log(c(C.GRAY, f"Resume watcher: yeni dosya → {fname}"))
+                if current_fh:
+                    current_fh.close()
+                current_fh = open(os.path.join(projects_dir, fname), "r", encoding="utf-8", errors="ignore")
+                known_files = all_files
+                continue
+
+            time.sleep(0.5)
+
+        if current_fh:
+            current_fh.close()
 
     t = threading.Thread(target=_watch, daemon=True)
     t.start()
@@ -537,6 +569,10 @@ def main():
     log(c(C.CYAN + C.BOLD, "Backlog izleniyor... (.ai/backlog.md)"))
     last_mtime = _backlog_mtime()
 
+    # Backlog moduna ilk girişte hemen resume watcher başlat
+    resume_event = threading.Event()
+    start_resume_watcher(resume_event, projects_dir)
+
     while True:
         time.sleep(BACKLOG_POLL)
 
@@ -589,9 +625,10 @@ def main():
         log(c(C.CYAN + C.BOLD, "Backlog izleniyor..."))
         last_mtime = _backlog_mtime()
 
-        # Backlog modunda RESUME_MARKER için hafif watcher başlat
+        # Yeni resume watcher başlat (bir önceki görevin JSONL'ının sonundan izle)
         resume_event = threading.Event()
         start_resume_watcher(resume_event, projects_dir)
+        log(c(C.GRAY, "Resume watcher yeniden başlatıldı."))
 
 
 if __name__ == "__main__":
