@@ -91,6 +91,7 @@ def focus_window(hwnd):
 PROMPT_FILE = "prompt.md"
 LOG_FILE = "agent.log"
 DONE_MARKER = "### AGENT_TASK_COMPLETED ###"
+RESUME_MARKER = "### AGENT_TASK_STARTED ###"   # Claude yeni göreve başlarken bunu yazdığında sayma döngüsüne dön
 CLAUDE_START_WAIT = 6   # saniye — claude UI'sinin yüklenmesini bekle
 
 
@@ -265,10 +266,10 @@ def _fmt_tokens(usage):
     return "  ".join(parts)
 
 
-def start_log_watcher(stop_event, done_event, projects_dir, existing_jsonls):
+def start_log_watcher(stop_event, done_event, resume_event, projects_dir, existing_jsonls):
     """
     Yeni JSONL oturum dosyasını tail eder; her assistant mesajını agent.log'a yazar.
-    DONE_MARKER görününce done_event'i set eder.
+    DONE_MARKER görününce done_event, RESUME_MARKER görününce resume_event set eder.
     """
     def _watch():
         open(LOG_FILE, "w", encoding="utf-8").close()
@@ -341,12 +342,59 @@ def start_log_watcher(stop_event, done_event, projects_dir, existing_jsonls):
                     tok_str = f"in={usage.get('input_tokens',0)} out={usage.get('output_tokens',0)}"
                     log(c(C.GRAY, f"[{model}] #{msg_count} {tok_str}  stop={stop_reason}"))
 
-                    # Sadece asistan yanıtlarında DONE_MARKER ara (kullanıcı prompt'unu atla)
-                    if any(DONE_MARKER in t for t in texts):
-                        _agent_log(f"=== {DONE_MARKER} ===")
-                        log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_COMPLETED algılandı — izleme durduruluyor."))
-                        done_event.set()
-                        return
+                    # Sadece asistan yanıtlarında marker'ları ara (kullanıcı prompt'unu atla)
+                    for t in texts:
+                        if DONE_MARKER in t:
+                            _agent_log(f"=== {DONE_MARKER} ===")
+                            log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_COMPLETED algılandı."))
+                            done_event.set()
+                        if RESUME_MARKER in t:
+                            _agent_log(f"=== {RESUME_MARKER} ===")
+                            log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_STARTED algılandı — sayma döngüsüne dönülüyor."))
+                            resume_event.set()
+
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+    return t
+
+
+def start_resume_watcher(resume_event, projects_dir):
+    """
+    Backlog modunda çalışır: mevcut en güncel JSONL dosyasının SONUNDAN izlemeye başlar,
+    RESUME_MARKER görününce resume_event set eder.
+    """
+    def _watch():
+        try:
+            files = [f for f in os.listdir(projects_dir) if f.endswith(".jsonl")]
+            if not files:
+                return
+            session_file = os.path.join(
+                projects_dir,
+                max(files, key=lambda f: os.path.getmtime(os.path.join(projects_dir, f)))
+            )
+        except Exception:
+            return
+
+        log(c(C.GRAY, f"Resume watcher: {os.path.basename(session_file)}"))
+
+        with open(session_file, "r", encoding="utf-8", errors="ignore") as f:
+            f.seek(0, 2)  # dosyanın sonuna konumlan — sadece yeni satırları izle
+            while not resume_event.is_set():
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "assistant":
+                    for block in obj.get("message", {}).get("content", []):
+                        if block.get("type") == "text" and RESUME_MARKER in block.get("text", ""):
+                            _agent_log(f"=== {RESUME_MARKER} (resume watcher) ===")
+                            log(c(C.GREEN + C.BOLD, "✓ AGENT_TASK_STARTED algılandı (resume watcher)."))
+                            resume_event.set()
+                            return
 
     t = threading.Thread(target=_watch, daemon=True)
     t.start()
@@ -360,7 +408,88 @@ RECHECK_AFTER = 15    # continue sonrası kaç saniye beklensin
 IDLE_THRESHOLD = 30    # pct kaç tur üst üste aynı kalırsa görev bitti sayılır
 BACKLOG_FILE = os.path.join(".ai", "backlog.md")
 BACKLOG_MSG = "Backlog güncellendi. Dosyayı oku ve kaldığın yerden devam et."
-BACKLOG_POLL = 30    # backlog izleme aralığı (saniye)
+BACKLOG_POLL = 15    # backlog izleme aralığı (saniye) — resume_event de bu aralıkta kontrol edilir
+
+
+def _backlog_mtime():
+    try:
+        return os.path.getmtime(BACKLOG_FILE)
+    except OSError:
+        return 0
+
+
+def run_monitoring_loop(pid, pyautogui, done_event, resume_event, stop_event):
+    """
+    Token kullanımını izler, limit dolunca 'continue' gönderir.
+    done_event veya resume_event set edilince durur.
+    pid kapanınca durur.
+    """
+    last_pct = None
+    same_pct_count = 0
+
+    while True:
+        if done_event.is_set() or resume_event.is_set():
+            stop_event.set()
+            return
+
+        time.sleep(POLL_INTERVAL)
+
+        if done_event.is_set() or resume_event.is_set():
+            stop_event.set()
+            return
+
+        if pid not in _all_claude_pids():
+            log(c(C.YELLOW, "claude.exe kapandı."))
+            stop_event.set()
+            return
+
+        reset_at, pct = usage_sorgu()
+
+        if reset_at is None:
+            if pct == last_pct:
+                same_pct_count += 1
+                log(c(C.GRAY, f"Limit yok (%{pct}, {same_pct_count}/{IDLE_THRESHOLD} tur sabit)."))
+                if same_pct_count >= IDLE_THRESHOLD:
+                    log(c(C.GREEN + C.BOLD, f"✓ Token {IDLE_THRESHOLD} tur değişmedi — görev tamamlandı sayılıyor."))
+                    stop_event.set()
+                    return
+            else:
+                same_pct_count = 0
+                log(c(C.GRAY, f"Limit yok (%{pct}). {POLL_INTERVAL}s sonra tekrar."))
+            last_pct = pct
+            continue
+
+        bekle = max(0, int((reset_at - datetime.now()).total_seconds()))
+        log(c(C.ORANGE, f"Limit dolu (%{pct}). Reset: {reset_at.strftime('%d %b %H:%M:%S')} — {bekle}s bekleniyor."))
+
+        while True:
+            if done_event.is_set() or resume_event.is_set():
+                break
+            kalan = int((reset_at - datetime.now()).total_seconds())
+            if kalan <= 0:
+                break
+            log(c(C.GRAY, f"  {kalan}s kaldı..."))
+            time.sleep(min(60, kalan))
+
+        if done_event.is_set() or resume_event.is_set():
+            stop_event.set()
+            return
+
+        hwnd = _terminal_hwnd(pid)
+        if not hwnd:
+            log(c(C.RED, "Terminal penceresi kayboldu."))
+            stop_event.set()
+            return
+
+        log(c(C.GREEN, "Süre doldu, 'continue' gönderiliyor."))
+        focus_window(hwnd)
+        pyautogui.typewrite("continue", interval=0.05)
+        pyautogui.press("enter")
+        log(c(C.GREEN, "continue gönderildi."))
+
+        same_pct_count = 0
+        last_pct = None
+        time.sleep(RECHECK_AFTER)
 
 
 def main():
@@ -397,184 +526,72 @@ def main():
     send_prompt(hwnd, prompt, pyautogui)
     log(c(C.GREEN, "Prompt gönderildi. İzleme başlıyor...\n"))
 
-    # JSONL watcher başlat
+    # ── İzleme döngüsü (ilk görev) ───────────────────────────────────────────
     stop_event = threading.Event()
     done_event = threading.Event()
-    start_log_watcher(stop_event, done_event, projects_dir, existing_jsonls)
+    resume_event = threading.Event()
+    start_log_watcher(stop_event, done_event, resume_event, projects_dir, existing_jsonls)
+    run_monitoring_loop(pid, pyautogui, done_event, resume_event, stop_event)
 
-    # İzleme döngüsü
-    last_pct = None
-    same_pct_count = 0
-
-    while True:
-        # Görev tamamlandı mı? (log marker)
-        if done_event.is_set():
-            stop_event.set()
-            break
-
-        time.sleep(POLL_INTERVAL)
-
-        if done_event.is_set():
-            stop_event.set()
-            break
-
-        # claude hâlâ çalışıyor mu?
-        if pid not in _all_claude_pids():
-            log(c(C.YELLOW, "claude.exe kapandı."))
-            stop_event.set()
-            break
-
-        reset_at, pct = usage_sorgu()
-
-        if reset_at is None:
-            # Token değişmedi mi say
-            if pct == last_pct:
-                same_pct_count += 1
-                log(c(C.GRAY, f"Limit yok (%{pct}, {same_pct_count}/{IDLE_THRESHOLD} tur sabit)."))
-                if same_pct_count >= IDLE_THRESHOLD:
-                    log(c(C.GREEN + C.BOLD, f"✓ Token {IDLE_THRESHOLD} tur değişmedi — görev tamamlandı sayılıyor."))
-                    stop_event.set()
-                    break
-            else:
-                same_pct_count = 0
-                log(c(C.GRAY, f"Limit yok (%{pct}). {POLL_INTERVAL}s sonra tekrar."))
-            last_pct = pct
-            continue
-
-        bekle = max(0, int((reset_at - datetime.now()).total_seconds()))
-        log(c(C.ORANGE, f"Limit dolu (%{pct}). Reset: {reset_at.strftime('%d %b %H:%M:%S')} — {bekle}s bekleniyor."))
-
-        while True:
-            if done_event.is_set():
-                break
-            kalan = int((reset_at - datetime.now()).total_seconds())
-            if kalan <= 0:
-                break
-            log(c(C.GRAY, f"  {kalan}s kaldı..."))
-            time.sleep(min(60, kalan))
-
-        if done_event.is_set():
-            stop_event.set()
-            break
-
-        hwnd = _terminal_hwnd(pid)
-        if not hwnd:
-            log(c(C.RED, "Terminal penceresi kayboldu."))
-            stop_event.set()
-            break
-
-        log(c(C.GREEN, "Süre doldu, 'continue' gönderiliyor."))
-        focus_window(hwnd)
-        pyautogui.typewrite("continue", interval=0.05)
-        pyautogui.press("enter")
-        log(c(C.GREEN, "continue gönderildi."))
-
-        # Continue sonrası token değişeceğinden sayacı sıfırla
-        same_pct_count = 0
-        last_pct = None
-
-        time.sleep(RECHECK_AFTER)
-
-    # ── Görev bitti — backlog izlemeye geç ───────────────────────────────────
+    # ── Backlog izleme ────────────────────────────────────────────────────────
     log(c(C.CYAN + C.BOLD, "Backlog izleniyor... (.ai/backlog.md)"))
-
-    def _backlog_mtime():
-        try:
-            return os.path.getmtime(BACKLOG_FILE)
-        except OSError:
-            return 0
-
     last_mtime = _backlog_mtime()
 
     while True:
         time.sleep(BACKLOG_POLL)
 
-        # claude kapandıysa çık
         if pid not in _all_claude_pids():
             log(c(C.YELLOW, "claude.exe kapandı, backlog izleme durdu."))
             break
 
+        # resume_event: Claude custom prompt'tan RESUME_MARKER çıkardı
+        new_task_from_resume = resume_event.is_set()
+        # backlog.md değişti mi?
         mtime = _backlog_mtime()
-        if mtime > last_mtime:
+        new_task_from_backlog = mtime > last_mtime
+
+        if not new_task_from_resume and not new_task_from_backlog:
+            # Hiç olay yok; resume watcher çalışıyor mu kontrol et (ilk turda başlat)
+            continue
+
+        if new_task_from_resume:
+            log(c(C.CYAN, "RESUME_MARKER algılandı — yeni görev izleniyor."))
+
+        if new_task_from_backlog:
             last_mtime = mtime
             log(c(C.CYAN, "Backlog değişti, claude'a bildiriliyor..."))
-
             hwnd = _terminal_hwnd(pid)
-            if not hwnd:
-                log(c(C.RED, "Terminal penceresi bulunamadı."))
-                continue
-
-            focus_window(hwnd)
-            clipboard_set(BACKLOG_MSG)
-            pyautogui.hotkey("ctrl", "v")
-            time.sleep(0.2)
-            pyautogui.press("enter")
-            log(c(C.GREEN, "Backlog mesajı gönderildi."))
-
-            # Yeni görev başladı — izleme döngüsüne geri dön
-            log(c(C.CYAN, "Yeni görev izleniyor..."))
-            last_pct = None
-            same_pct_count = 0
-            stop_event.clear()
-            done_event.clear()
-            try:
-                existing_jsonls = set(os.listdir(projects_dir))
-            except Exception:
-                existing_jsonls = set()
-            start_log_watcher(stop_event, done_event, projects_dir, existing_jsonls)
-
-            # Ana izleme döngüsünü yeniden çalıştır
-            while True:
-                if done_event.is_set():
-                    stop_event.set()
-                    break
-                time.sleep(POLL_INTERVAL)
-                if done_event.is_set():
-                    stop_event.set()
-                    break
-                if pid not in _all_claude_pids():
-                    log(c(C.YELLOW, "claude.exe kapandı."))
-                    stop_event.set()
-                    break
-                reset_at, pct = usage_sorgu()
-                if reset_at is None:
-                    if pct == last_pct:
-                        same_pct_count += 1
-                        log(c(C.GRAY, f"Limit yok (%{pct}, {same_pct_count}/{IDLE_THRESHOLD} tur sabit)."))
-                        if same_pct_count >= IDLE_THRESHOLD:
-                            log(c(C.GREEN + C.BOLD, "✓ Görev tamamlandı — backlog bekleniyor."))
-                            stop_event.set()
-                            break
-                    else:
-                        same_pct_count = 0
-                        log(c(C.GRAY, f"Limit yok (%{pct})."))
-                    last_pct = pct
-                    continue
-                bekle = max(0, int((reset_at - datetime.now()).total_seconds()))
-                log(c(C.ORANGE, f"Limit dolu (%{pct}). {bekle}s bekleniyor."))
-                while True:
-                    if done_event.is_set():
-                        break
-                    kalan = int((reset_at - datetime.now()).total_seconds())
-                    if kalan <= 0:
-                        break
-                    time.sleep(min(60, kalan))
-                if done_event.is_set():
-                    stop_event.set()
-                    break
-                hwnd = _terminal_hwnd(pid)
-                if not hwnd:
-                    break
+            if hwnd:
                 focus_window(hwnd)
-                pyautogui.typewrite("continue", interval=0.05)
+                clipboard_set(BACKLOG_MSG)
+                pyautogui.hotkey("ctrl", "v")
+                time.sleep(0.2)
                 pyautogui.press("enter")
-                log(c(C.GREEN, "continue gönderildi."))
-                same_pct_count = 0
-                last_pct = None
-                time.sleep(RECHECK_AFTER)
+                log(c(C.GREEN, "Backlog mesajı gönderildi."))
+            else:
+                log(c(C.RED, "Terminal penceresi bulunamadı."))
 
-            log(c(C.CYAN + C.BOLD, "Backlog izleniyor..."))
-            last_mtime = _backlog_mtime()
+        # Yeni izleme döngüsü başlat
+        try:
+            existing_jsonls = set(os.listdir(projects_dir))
+        except Exception:
+            existing_jsonls = set()
+
+        stop_event = threading.Event()
+        done_event = threading.Event()
+        resume_event = threading.Event()
+        start_log_watcher(stop_event, done_event, resume_event, projects_dir, existing_jsonls)
+
+        log(c(C.CYAN, "Yeni görev izleniyor..."))
+        run_monitoring_loop(pid, pyautogui, done_event, resume_event, stop_event)
+
+        # Döngü bitti; backlog beklemeye devam et
+        log(c(C.CYAN + C.BOLD, "Backlog izleniyor..."))
+        last_mtime = _backlog_mtime()
+
+        # Backlog modunda RESUME_MARKER için hafif watcher başlat
+        resume_event = threading.Event()
+        start_resume_watcher(resume_event, projects_dir)
 
 
 if __name__ == "__main__":
